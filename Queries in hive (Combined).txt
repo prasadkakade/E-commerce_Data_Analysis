@@ -1,0 +1,220 @@
+
+-------Create folder in HDFS to copy data from S3--------
+
+hadoop fs -ls /
+
+hadoop fs -mkdir /case_study
+
+hadoop fs -ls /
+
+
+
+
+-------Load data from S3--------
+
+hadoop distcp s3://hivecasestudy/casestudyinput/2019-Nov.csv /case_study/2019-Nov.csv
+hadoop distcp s3://hivecasestudy/casestudyinput/2019-Oct.csv /case_study/2019-Oct.csv
+
+hadoop fs -ls /case_study/
+
+
+
+
+
+-------Launch Hive and create database for case study--------
+
+hive
+
+show databases;
+
+create database if not exists db_hive;
+
+use db_hive;
+
+
+
+
+
+-------create table using CSVserde--------
+
+create external table oct_nov_data (event_time timestamp,event_type string,product_id string,category_id string,category_code string,brand string,price float,user_id bigint,user_session string) 
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'WITH SERDEPROPERTIES ("separatorChar" = ",") stored as textfile tblproperties("skip.header.line.count" = "1");
+
+
+
+
+
+-------Display/Describe tables created--------
+
+show tables;
+desc oct_nov_data;
+
+
+
+
+
+-------Loading data in tables--------
+
+load data inpath '/case_study/2019-Oct.csv' into table oct_nov_data;
+load data inpath '/case_study/2019-Nov.csv' into table oct_nov_data;
+
+
+
+
+
+-------Checking data is loaded or not--------
+
+set hive.cli.print.header=true;
+
+select * from oct_nov_data limit 5;
+Select count(*) from oct_nov_data;
+
+
+
+
+
+-------New table creation from existing tables to change datatype--------
+
+create external table oct_nov_table (event_time timestamp,event_type string,product_id string,category_id string,category_code string,brand string,price float,user_id bigint,user_session string);
+
+
+show tables;
+desc oct_nov_table;
+
+
+
+
+
+
+-------Loading data in tables--------
+
+insert into table oct_nov_table select from_unixtime(unix_timestamp(event_time)), event_type, product_id, category_id, category_code, brand, price, user_id, user_session from oct_nov_data;
+
+select * from oct_nov_table limit 5;
+
+
+
+
+
+ 
+-------Creating dynamic partitioning on event_type--------
+
+create table if not exists dyna_part_event_type (event_time timestamp,product_id string,category_id string,category_code string,brand string,price float,user_id bigint,user_session string) partitioned by (event_type string) row format delimited fields terminated by ',' lines terminated by '\n';
+
+set hive.exec.dynamic.partition=true;
+set hive.exec.dynamic.partition.mode = nonstrict;
+
+insert into table dyna_part_event_type partition (event_type) select from_unixtime(unix_timestamp(event_time)), product_id, category_id, category_code, brand, price, user_id, user_session, event_type from oct_nov_table;
+
+show partitions dyna_part_event_type;
+
+
+
+
+
+
+
+-------Query 1 (Find the total revenue generated due to purchases made in October)--------
+
+select month(event_time), sum(price) from oct_nov_table where event_type = 'purchase' and month(event_time)=10 group by month(event_time);
+select month(event_time), sum(price) from dyna_part_event_type where event_type = 'purchase' and month(event_time)=10 group by month(event_time);
+
+
+
+
+
+-------Query 2 (Write a query to yield the total sum of purchases per month in a single output )--------
+
+select month(event_time), sum(price) from oct_nov_table where event_type = 'purchase' group by month(event_time);
+select month(event_time), sum(price) from dyna_part_event_type where event_type = 'purchase' group by month(event_time);
+
+
+
+
+
+-------Query 3 (Write a query to find the change in revenue generated due to purchases from October to November)--------
+
+with q as (select month(event_time) as month, sum(price) as total_sales from dyna_part_event_type where event_type = 'purchase' group by month(event_time)) select q1.total_sales-q2.total_sales from q as q1 inner join q as q2 on q1.month = q2.month + 1 ;
+
+
+
+
+
+
+-------Query 4 (Find distinct categories of products. Categories with null category code can be ignored)--------
+
+create table if not exists dyna_part_category (product_id string) partitioned by (category_code string) row format delimited fields terminated by ',' lines terminated by '\n';
+
+insert into table dyna_part_category partition (category_code) select product_id, category_code from oct_nov_table;
+
+select distinct(category_code) from oct_nov_table where length(category_code)>0;
+select distinct(category_code) from dyna_part_category where length(category_code)>0;
+
+
+
+
+
+
+-------Query 5 (Find the total number of products available under each category)--------
+
+select category_code, count(distinct product_id) as product_count from oct_nov_table where length(category_code)>0 group by category_code order by product_count desc;
+select category_code, count(distinct product_id) as product_count from dyna_part_category where length(category_code)>0 group by category_code order by product_count desc;
+
+
+
+
+
+
+-------Query 6 (Which brand had the maximum sales in October and November combined)--------
+
+create table if not exists bucket_brand (event_time timestamp, brand string, price float) partitioned by (event_type string) clustered by (brand) into 10 buckets row format delimited fields terminated by ',' lines terminated by '\n';
+
+insert into table bucket_brand partition(event_type) select event_time, brand, price, event_type from oct_nov_table;
+
+select brand, sum(price) as max_sales from oct_nov_table where length(brand)>0 and event_type = 'purchase' group by brand order by max_sales desc limit 1;
+select brand, sum(price) as max_sales from bucket_brand where length(brand)>0 and event_type = 'purchase' group by brand order by max_sales desc limit 1;
+
+
+
+
+
+
+-------Query 7 (Which brands increased their sales from October to November)--------
+
+
+with com_data as (
+select event_time, brand, sum(price) as rev 
+from bucket_brand 
+where event_type = 'purchase' and length(brand)>0 group by event_time,brand order by event_time desc)
+
+select q1.brand, (q1.rev - q2.rev) as rev_diff 
+from com_data as q1 inner join com_data as q2 on (q1.brand = q2.brand and q1.event_time = q2.event_time + 1)
+ where (q1.rev - q2.rev) > 0 order by rev_diff desc;
+
+
+
+
+
+
+-------Query 8 (Your company wants to reward the top 10 users of its website with a Golden Customer plan. Write a query to generate a list of top 10 users who spend the most)--------
+
+
+select user_id, sum(price) as total_spend from oct_nov_table where event_type = 'purchase' group by user_id order by total_spend desc limit 10;
+
+select user_id, sum(price) as total_spend from dyna_part_event_type where event_type = 'purchase' group by user_id order by total_spend desc limit 10;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
